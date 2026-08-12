@@ -1,12 +1,15 @@
 from datetime import datetime, timezone
 import json
 import os
+import re
 import time
+from typing import Optional
 from urllib.parse import urljoin
-import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
 
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
 BASE_URL = "https://books.toscrape.com/catalogue/"
 FIRST_PAGE_URL = urljoin(BASE_URL, "page-1.html")
 
@@ -14,9 +17,19 @@ HEADERS = {
     "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/DenizBitmez/flyrank-polite-scraper)"
 }
 
+class BookRecord(BaseModel):
+  title: str = Field(..., min_length=1)
+  product_url: str  # Veya HttpUrl
+  price_text: str
+  price_gbp: float = Field(..., gt=0)
+  availability_text: str
+  rating_text: Optional[str] = None
+  description: Optional[str] = None
+  source_page: str
+  fetched_at: str
+
 
 def get_page_html(url, cache_filename):
-  """Sayfayı önce cache'den arar, yoksa internetten çeker ve cache'ler."""
   os.makedirs(CACHE_DIR, exist_ok=True)
   cache_path = os.path.join(CACHE_DIR, cache_filename)
 
@@ -25,7 +38,6 @@ def get_page_html(url, cache_filename):
       return f.read()
 
   time.sleep(0.5)
-
   response = requests.get(url, headers=HEADERS, timeout=5)
   if response.status_code != 200:
     raise Exception(
@@ -35,13 +47,12 @@ def get_page_html(url, cache_filename):
   html_content = response.text
   with open(cache_path, "w", encoding="utf-8") as f:
     f.write(html_content)
-
   return html_content
 
 
 def discover_catalogue_pages():
   current_url = FIRST_PAGE_URL
-  discovered_books = []  # (book_url, source_page_url) ikililerini tutacağız
+  discovered_books = []
   catalogue_pages_count = 0
 
   for page_num in range(1, 4):
@@ -71,10 +82,9 @@ def discover_catalogue_pages():
   return unique_books
 
 
-def extract_book_details():
+def extract_and_validate_records():
   unique_books = discover_catalogue_pages()
   raw_records = []
-  detail_pages_count = 0
 
   print(
       f"\nStarting to fetch detail pages for {len(unique_books)} unique"
@@ -84,8 +94,6 @@ def extract_book_details():
   for idx, (book_url, source_page) in enumerate(unique_books.items(), 1):
     book_cache_name = f"book-{idx}.html"
     html = get_page_html(book_url, book_cache_name)
-    detail_pages_count += 1
-
     soup = BeautifulSoup(html, "html.parser")
 
     title_el = soup.select_one("div.product_main h1")
@@ -117,7 +125,7 @@ def extract_book_details():
         .replace("+00:00", "Z")
     )
 
-    record = {
+    raw_records.append({
         "title": title,
         "product_url": book_url,
         "price_text": price_text,
@@ -126,16 +134,50 @@ def extract_book_details():
         "description": description,
         "source_page": source_page,
         "fetched_at": fetched_at,
-    }
-    raw_records.append(record)
+    })
 
-  print(f"\n--- STAGE 3 EXTRACTION REPORT ---")
-  print(f"detail_pages = {detail_pages_count}")
-  print("\nSample Complete Raw Record (8 keys):")
-  print(json.dumps(raw_records[0], indent=2, ensure_ascii=False))
+  os.makedirs(OUTPUT_DIR, exist_ok=True)
+  valid_records = []
+  error_records = []
+  seen_urls = set()  # Idempotency / unique enforcement
 
-  return raw_records
+  for record in raw_records:
+
+    price_val = record.get("price_text")
+    price_gbp = 0.0
+    if price_val:
+      numeric_string = re.sub(r"[^\d.]", "", price_val)
+      try:
+        price_gbp = float(numeric_string)
+      except ValueError:
+        price_gbp = 0.0
+
+    record["price_gbp"] = price_gbp
+
+    canonical_url = record.get("product_url")
+    if canonical_url in seen_urls:
+      continue  # Zaten eklenmişse atla
+    seen_urls.add(canonical_url)
+
+    try:
+      validated_model = BookRecord(**record)
+      valid_records.append(validated_model.model_dump())
+    except ValidationError as e:
+      error_records.append({"record": record, "errors": e.errors()})
+
+  books_path = os.path.join(OUTPUT_DIR, "books.json")
+  errors_path = os.path.join(OUTPUT_DIR, "errors.json")
+
+  with open(books_path, "w", encoding="utf-8") as f:
+    json.dump(valid_records, f, indent=2, ensure_ascii=False)
+
+  with open(errors_path, "w", encoding="utf-8") as f:
+    json.dump(error_records, f, indent=2, ensure_ascii=False)
+
+  print(f"\n--- STAGE 4 VALIDATION REPORT ---")
+  print(f"Valid records saved to output/books.json: {len(valid_records)}")
+  print(f"Invalid records saved to output/errors.json: {len(error_records)}")
 
 
 if __name__ == "__main__":
-  extract_book_details()
+  extract_and_validate_records()
